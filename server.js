@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 const path = require('path');
 const crypto = require('crypto');
 const { promisify } = require('util');
@@ -21,6 +21,8 @@ const client = new MongoClient(process.env.MONGODB_URI);
 let appsCollection;
 let usersCollection;
 let sessionsCollection;
+let submissionsCollection;
+let settingsCollection;
 let dummyPasswordHash;
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
@@ -104,7 +106,7 @@ async function requireUser(req, res, next) {
     const tokenHash = tokenDigest(match[1]);
     const session = await sessionsCollection.findOne({ tokenHash, expiresAt: { $gt: new Date() } });
     if (!session) return res.status(401).json({ error: 'Sessão expirada. Entre novamente.' });
-    const user = await usersCollection.findOne({ _id: session.userId }, { projection: { account: 1, email: 1 } });
+    const user = await usersCollection.findOne({ _id: session.userId }, { projection: { account: 1, email: 1, role: 1, developerStatus: 1, developerName: 1 } });
     if (!user) return res.status(401).json({ error: 'Conta indisponível. Entre novamente.' });
     req.authUser = user;
     req.authTokenHash = tokenHash;
@@ -112,6 +114,20 @@ async function requireUser(req, res, next) {
   } catch {
     res.status(503).json({ error: 'Não foi possível validar a sessão agora.' });
   }
+}
+
+function requireAdmin(req, res, next) {
+  requireUser(req, res, () => {
+    if (req.authUser.role !== 'admin') return res.status(403).json({ error: 'Acesso restrito ao administrador.' });
+    next();
+  });
+}
+
+function requireDeveloper(req, res, next) {
+  requireUser(req, res, () => {
+    if (req.authUser.developerStatus !== 'active') return res.status(403).json({ error: 'A conta ainda não tem acesso de desenvolvedor aprovado.' });
+    next();
+  });
 }
 
 app.post('/api/auth/register', authLimiter, async (req, res) => {
@@ -124,7 +140,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const passwordHash = await hashPassword(password);
     const now = new Date();
-    const result = await usersCollection.insertOne({ account, email, passwordHash, createdAt: now });
+    const result = await usersCollection.insertOne({ account, email, passwordHash, role: 'user', developerStatus: 'none', createdAt: now });
     const token = await createSession(result.insertedId);
     res.set('Cache-Control', 'no-store');
     return res.status(201).json({ token, user: { account, email } });
@@ -158,7 +174,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
 app.get('/api/auth/me', requireUser, (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ user: { account: req.authUser.account, email: req.authUser.email } });
+  res.json({ user: { account: req.authUser.account, email: req.authUser.email, role: req.authUser.role || 'user', developerStatus: req.authUser.developerStatus || 'none', developerName: req.authUser.developerName || '' } });
 });
 
 app.delete('/api/auth/session', requireUser, async (req, res) => {
@@ -167,6 +183,51 @@ app.delete('/api/auth/session', requireUser, async (req, res) => {
     return res.status(204).end();
   } catch {
     return res.status(503).json({ error: 'Não foi possível encerrar a sessão no servidor.' });
+  }
+});
+
+app.post('/api/admin/bootstrap', authLimiter, requireUser, async (req, res) => {
+  const supplied = typeof req.body?.key === 'string' ? req.body.key : '';
+  const expected = process.env.SANSTORE_ADMIN_BOOTSTRAP_KEY || '';
+  if (!expected) return res.status(503).json({ error: 'A ativação inicial do administrador não está configurada.' });
+  if (!supplied || !safeEqual(supplied, expected)) return res.status(401).json({ error: 'Código de ativação inválido.' });
+  try {
+    if (await usersCollection.countDocuments({ role: 'admin' }) > 0) return res.status(409).json({ error: 'O administrador inicial já foi ativado.' });
+    const claim = await settingsCollection.updateOne(
+      { _id: 'admin_bootstrap', claimed: { $ne: true } },
+      { $set: { claimed: true, claimedAt: new Date(), claimedBy: req.authUser._id } },
+    );
+    if (claim.matchedCount !== 1) return res.status(409).json({ error: 'A ativação inicial já foi usada.' });
+    const updated = await usersCollection.updateOne({ _id: req.authUser._id, role: { $ne: 'admin' } }, { $set: { role: 'admin', adminGrantedAt: new Date() } });
+    if (updated.modifiedCount !== 1) {
+      await settingsCollection.updateOne({ _id: 'admin_bootstrap', claimedBy: req.authUser._id }, { $set: { claimed: false }, $unset: { claimedAt: '', claimedBy: '' } });
+      return res.status(409).json({ error: 'Não foi possível ativar esta conta como administradora.' });
+    }
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, user: { account: req.authUser.account, email: req.authUser.email, role: 'admin' } });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível ativar o administrador agora.' });
+  }
+});
+
+app.get('/api/admin/me', requireAdmin, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ user: { account: req.authUser.account, email: req.authUser.email, role: 'admin' } });
+});
+
+app.get('/api/developer/me', requireUser, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ status: req.authUser.developerStatus || 'none', developerName: req.authUser.developerName || '' });
+});
+
+app.post('/api/developer/request', authLimiter, requireUser, async (req, res) => {
+  try {
+    if (req.authUser.developerStatus === 'active') return res.json({ status: 'active' });
+    if (req.authUser.developerStatus === 'pending') return res.json({ status: 'pending' });
+    await usersCollection.updateOne({ _id: req.authUser._id }, { $set: { developerStatus: 'pending', developerRequestedAt: new Date() } });
+    return res.status(202).json({ status: 'pending' });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível solicitar acesso agora.' });
   }
 });
 
@@ -181,7 +242,7 @@ app.get('/api/health', readLimiter, async (_req, res) => {
 
 app.get('/api/apps', readLimiter, async (_req, res) => {
   try {
-    const docs = await appsCollection.find({}, { projection: { slug: 1, name: 1, category: 1, image: 1, apk: 1, description: 1, createdAt: 1, featured: 1 } })
+    const docs = await appsCollection.find({ $or: [{ status: { $exists: false } }, { status: 'approved' }] }, { projection: { slug: 1, name: 1, category: 1, image: 1, apk: 1, description: 1, createdAt: 1, featured: 1 } })
       .sort({ createdAt: -1 }).limit(500).toArray();
     res.set('Cache-Control', 'no-store');
     res.json(docs.map((doc) => ({
@@ -195,6 +256,31 @@ app.get('/api/apps', readLimiter, async (_req, res) => {
   }
 });
 
+app.post('/api/submissions', publishLimiter, requireDeveloper, async (req, res) => {
+  const { name, category, image, apk, description } = req.body || {};
+  if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
+      !['App', 'Game'].includes(category) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
+      typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) {
+    return res.status(400).json({ error: 'Confira nome, categoria, links HTTPS e descrição.' });
+  }
+  try {
+    const submission = {
+      name: name.trim(), category,
+      image: new URL(image).href, apk: new URL(apk).href,
+      description: description.trim(), status: 'pending',
+      submittedBy: req.authUser._id, developerAccount: req.authUser.account,
+      developerName: req.authUser.developerName || req.authUser.account,
+      createdAt: new Date(),
+    };
+    const result = await submissionsCollection.insertOne(submission);
+    res.set('Cache-Control', 'no-store');
+    return res.status(202).json({ id: result.insertedId.toString(), status: 'pending', message: 'Enviado para aprovação do administrador.' });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível enviar para aprovação agora.' });
+  }
+});
+
+// Legacy web submissions are also queued for review; this route can no longer publish directly.
 app.post('/api/apps', publishLimiter, publishAuth, async (req, res) => {
   const { name, category, image, apk, description } = req.body || {};
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
@@ -203,21 +289,183 @@ app.post('/api/apps', publishLimiter, publishAuth, async (req, res) => {
     return res.status(400).json({ error: 'Confira nome, categoria, links HTTPS e descrição.' });
   }
   try {
-    const record = {
+    const submission = {
       name: name.trim(), category,
       image: new URL(image).href, apk: new URL(apk).href,
-      description: description.trim(), createdAt: new Date(),
+      description: description.trim(), status: 'pending',
+      submittedBy: null, developerAccount: 'web-publisher', developerName: 'Desenvolvedor da loja',
+      createdAt: new Date(), source: 'legacy-web-form',
     };
-    const result = await appsCollection.insertOne(record);
-    res.status(201).json({ id: result.insertedId.toString(), ...record, featured: false });
-  } catch (error) {
-    console.error('Could not publish app:', error.message);
-    res.status(503).json({ error: 'Não foi possível salvar no MongoDB.' });
+    const result = await submissionsCollection.insertOne(submission);
+    res.set('Cache-Control', 'no-store');
+    return res.status(202).json({ id: result.insertedId.toString(), status: 'pending', message: 'Enviado para aprovação do administrador.' });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível enviar para aprovação agora.' });
   }
 });
 
-app.use(express.static(__dirname, { extensions: ['html'], maxAge: '1h' }));
-app.get(/.*/, (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+function parseObjectId(value) {
+  return ObjectId.isValid(value) ? new ObjectId(value) : null;
+}
+
+function safeSlug(value, id) {
+  const base = String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'app';
+  return `${base}-${id.toString()}`;
+}
+
+function submissionPayload(body) {
+  const { name, category, image, apk, description } = body || {};
+  if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
+      !['App', 'Game'].includes(category) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
+      typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) return null;
+  return { name: name.trim(), category, image: new URL(image).href, apk: new URL(apk).href, description: description.trim() };
+}
+
+function submissionJson(doc) {
+  return {
+    id: doc._id.toString(), name: doc.name, category: doc.category, image: doc.image,
+    apk: doc.apk, description: doc.description, status: doc.status,
+    developerAccount: doc.developerAccount || 'desenvolvedor-web',
+    developerName: doc.developerName || doc.developerAccount || 'Desenvolvedor',
+    createdAt: doc.createdAt || null, rejectionReason: doc.rejectionReason || '',
+  };
+}
+
+app.get('/api/admin/submissions', requireAdmin, async (req, res) => {
+  try {
+    const requestedStatus = String(req.query.status || 'pending');
+    const query = requestedStatus === 'all' ? {} : { status: ['pending', 'approved', 'rejected'].includes(requestedStatus) ? requestedStatus : 'pending' };
+    const docs = await submissionsCollection.find(query).sort({ createdAt: -1 }).limit(200).toArray();
+    res.set('Cache-Control', 'no-store');
+    res.json(docs.map(submissionJson));
+  } catch {
+    res.status(503).json({ error: 'Não foi possível carregar as publicações.' });
+  }
+});
+
+app.get('/api/admin/submissions/:id', requireAdmin, async (req, res) => {
+  const id = parseObjectId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Identificador inválido.' });
+  try {
+    const doc = await submissionsCollection.findOne({ _id: id });
+    if (!doc) return res.status(404).json({ error: 'Publicação não encontrada.' });
+    res.set('Cache-Control', 'no-store');
+    res.json(submissionJson(doc));
+  } catch {
+    res.status(503).json({ error: 'Não foi possível abrir a publicação.' });
+  }
+});
+
+app.put('/api/admin/submissions/:id', requireAdmin, async (req, res) => {
+  const id = parseObjectId(req.params.id);
+  const payload = submissionPayload(req.body);
+  if (!id) return res.status(400).json({ error: 'Identificador inválido.' });
+  if (!payload) return res.status(400).json({ error: 'Confira nome, categoria, links HTTPS e descrição.' });
+  try {
+    const result = await submissionsCollection.updateOne(
+      { _id: id, status: 'pending' },
+      { $set: { ...payload, editedAt: new Date(), editedBy: req.authUser._id } },
+    );
+    if (result.matchedCount !== 1) return res.status(409).json({ error: 'Só é possível editar publicações aguardando análise.' });
+    const updated = await submissionsCollection.findOne({ _id: id });
+    res.json(submissionJson(updated));
+  } catch {
+    res.status(503).json({ error: 'Não foi possível salvar as alterações.' });
+  }
+});
+
+app.post('/api/admin/submissions/:id/approve', requireAdmin, async (req, res) => {
+  const id = parseObjectId(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Identificador inválido.' });
+  try {
+    const submission = await submissionsCollection.findOne({ _id: id });
+    if (!submission) return res.status(404).json({ error: 'Publicação não encontrada.' });
+    if (submission.status === 'rejected') return res.status(409).json({ error: 'Uma publicação recusada não pode ser aprovada.' });
+    const fields = submissionPayload(submission);
+    if (!fields) return res.status(400).json({ error: 'Os dados da publicação estão incompletos.' });
+    const submissionId = id.toString();
+    await appsCollection.updateOne(
+      { submissionId },
+      { $set: { ...fields, slug: safeSlug(fields.name, id), submissionId, status: 'pending_publication', featured: false, developerAccount: submission.developerAccount || 'desenvolvedor-web' }, $setOnInsert: { createdAt: submission.createdAt || new Date() } },
+      { upsert: true },
+    );
+    const publishedDoc = await appsCollection.findOne({ submissionId });
+    const reviewedAt = new Date();
+    if (submission.status !== 'approved') {
+      const result = await submissionsCollection.updateOne(
+        { _id: id, status: 'pending' },
+        { $set: { status: 'approved', approvedAppId: publishedDoc._id, reviewedAt, reviewedBy: req.authUser._id } },
+      );
+      if (result.matchedCount !== 1) {
+        const latest = await submissionsCollection.findOne({ _id: id });
+        if (!latest || latest.status !== 'approved') return res.status(409).json({ error: 'A publicação mudou de estado. Atualize a lista e tente novamente.' });
+      }
+    }
+    await appsCollection.updateOne({ submissionId }, { $set: { status: 'approved', approvedAt: reviewedAt } });
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, status: 'approved', appId: publishedDoc._id.toString() });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível aprovar esta publicação agora.' });
+  }
+});
+
+app.post('/api/admin/submissions/:id/reject', requireAdmin, async (req, res) => {
+  const id = parseObjectId(req.params.id);
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 300) : '';
+  if (!id) return res.status(400).json({ error: 'Identificador inválido.' });
+  try {
+    const result = await submissionsCollection.updateOne(
+      { _id: id, status: 'pending' },
+      { $set: { status: 'rejected', rejectionReason: reason, reviewedAt: new Date(), reviewedBy: req.authUser._id } },
+    );
+    if (result.matchedCount !== 1) return res.status(409).json({ error: 'Só é possível recusar publicações aguardando análise.' });
+    return res.json({ ok: true, status: 'rejected' });
+  } catch {
+    res.status(503).json({ error: 'Não foi possível recusar esta publicação agora.' });
+  }
+});
+
+app.get('/api/admin/developers', requireAdmin, async (_req, res) => {
+  try {
+    const docs = await usersCollection.find({}, { projection: { account: 1, email: 1, role: 1, developerStatus: 1, developerName: 1, developerRequestedAt: 1, createdAt: 1 } })
+      .sort({ developerRequestedAt: -1, createdAt: -1 }).limit(300).toArray();
+    res.set('Cache-Control', 'no-store');
+    res.json(docs.map((user) => ({ id: user._id.toString(), account: user.account, email: user.email, role: user.role || 'user', developerStatus: user.developerStatus || 'none', developerName: user.developerName || '', createdAt: user.createdAt || null, requestedAt: user.developerRequestedAt || null })));
+  } catch {
+    res.status(503).json({ error: 'Não foi possível carregar os desenvolvedores.' });
+  }
+});
+
+app.put('/api/admin/developers/:id', requireAdmin, async (req, res) => {
+  const id = parseObjectId(req.params.id);
+  const developerStatus = req.body?.developerStatus;
+  const developerNameInput = req.body?.developerName;
+  if (!id) return res.status(400).json({ error: 'Identificador inválido.' });
+  if (!['none', 'pending', 'active', 'suspended', 'rejected'].includes(developerStatus)) return res.status(400).json({ error: 'Estado de desenvolvedor inválido.' });
+  if (typeof developerNameInput !== 'string') return res.status(400).json({ error: 'Informe o nome público, ou deixe-o vazio para removê-lo.' });
+  const developerName = developerNameInput.trim();
+  if (developerName.length > 80) return res.status(400).json({ error: 'O nome público deve ter até 80 caracteres.' });
+  try {
+    const existing = await usersCollection.findOne({ _id: id }, { projection: { role: 1 } });
+    if (!existing) return res.status(404).json({ error: 'Conta não encontrada.' });
+    if (existing.role === 'admin') return res.status(409).json({ error: 'Não é possível alterar o desenvolvedor administrador por esta tela.' });
+    const update = { $set: { developerStatus, developerUpdatedAt: new Date(), developerUpdatedBy: req.authUser._id } };
+    if (developerName) update.$set.developerName = developerName;
+    else update.$unset = { developerName: '' };
+    if (developerStatus === 'active') update.$set.developerApprovedAt = new Date();
+    const result = await usersCollection.updateOne({ _id: id }, update);
+    if (result.matchedCount !== 1) return res.status(404).json({ error: 'Conta não encontrada.' });
+    const user = await usersCollection.findOne({ _id: id }, { projection: { account: 1, email: 1, developerStatus: 1, developerName: 1 } });
+    return res.json({ id: user._id.toString(), account: user.account, email: user.email, developerStatus: user.developerStatus, developerName: user.developerName || '' });
+  } catch {
+    res.status(503).json({ error: 'Não foi possível atualizar o desenvolvedor.' });
+  }
+});
+
+const publicDir = path.join(__dirname, 'public');
+app.use(express.static(publicDir, { extensions: ['html'], maxAge: '1h' }));
+app.get(/.*/, (_req, res) => res.sendFile(path.join(publicDir, 'index.html')));
 
 async function start() {
   await client.connect();
@@ -225,16 +473,26 @@ async function start() {
   appsCollection = db.collection('apps');
   usersCollection = db.collection('users');
   sessionsCollection = db.collection('sessions');
+  submissionsCollection = db.collection('submissions');
+  settingsCollection = db.collection('settings');
   dummyPasswordHash = await hashPassword(crypto.randomBytes(32).toString('hex'));
   await Promise.all([
     appsCollection.createIndex({ createdAt: -1 }),
     appsCollection.createIndex({ slug: 1 }, { unique: true, sparse: true }),
+    appsCollection.createIndex({ submissionId: 1 }, { unique: true, sparse: true }),
     usersCollection.createIndex({ account: 1 }, { unique: true }),
     usersCollection.createIndex({ email: 1 }, { unique: true }),
     sessionsCollection.createIndex({ tokenHash: 1 }, { unique: true }),
     sessionsCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
     sessionsCollection.createIndex({ userId: 1 }),
+    submissionsCollection.createIndex({ status: 1, createdAt: -1 }),
+    submissionsCollection.createIndex({ submittedBy: 1, createdAt: -1 }),
   ]);
+  await settingsCollection.updateOne(
+    { _id: 'admin_bootstrap' },
+    { $setOnInsert: { claimed: false, createdAt: new Date() } },
+    { upsert: true },
+  );
   await appsCollection.updateOne(
     { slug: 'sanbank-br-digital' },
     { $setOnInsert: {

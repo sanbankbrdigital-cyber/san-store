@@ -24,13 +24,7 @@ Não envie o arquivo `.env` para o GitHub.
 
 Crie um serviço web Node.js a partir desta pasta. Configure `npm install` como comando de instalação e `npm start` como comando de início. No painel privado da hospedagem, defina `MONGODB_URI`, `MONGODB_DB` (opcional; padrão `san_store`) e `APP_PUBLISH_KEY`. O provedor deve encaminhar a porta fornecida na variável `PORT`.
 
-A API oferece `GET /api/health`, `GET /api/apps` e `POST /api/apps` (protegido por chave). O card do SANBANK BR DIGITAL é inicializado no próprio catálogo; os outros apps são lidos do banco.
+A API oferece login/cadastro em `POST /api/auth/register` e `POST /api/auth/login`; solicitações de desenvolvedor em `POST /api/developer/request`; envios em `POST /api/submissions`; e revisão em `/api/admin/*` (somente administrador). `GET /api/apps` mostra apenas publicações aprovadas. O antigo `POST /api/apps` também fica apenas na fila de análise. Configure `SANSTORE_ADMIN_BOOTSTRAP_KEY` como segredo privado no Render para ativar o primeiro administrador. O card do SANBANK BR DIGITAL é inicializado no próprio catálogo.
 
-## Contas SAN STORE (Android)
 
-- `POST /api/auth/register` recebe `{ "account", "email", "password" }`; contas são normalizadas para minúsculas e o e-mail deve terminar em `@sanstore.com`. Retorna `{ "token", "user": { "account", "email" } }`.
-- `POST /api/auth/login` recebe `{ "identifier", "password" }`, aceitando nome da conta ou e-mail SAN STORE, e retorna o mesmo formato de sessão.
-- `GET /api/auth/me` exige `Authorization: Bearer <token>` e retorna os dados públicos da sessão.
-- `DELETE /api/auth/session` exige o mesmo token e encerra essa sessão.
-
-Nomes de conta: 3–20 caracteres, letras ASCII minúsculas, números, ponto, hífen ou sublinhado. Senhas: 8–10 caracteres, com pelo menos uma maiúscula, uma minúscula, um número e um símbolo. Os critérios são aplicados tanto no app quanto na API. Senhas são armazenadas como hashes scrypt com salt aleatório; tokens aleatórios de 30 dias são armazenados apenas como hashes SHA-256 e expiram automaticamente. Não há envio/verificação de e-mail configurado: `@sanstore.com` é um identificador da conta, não uma caixa postal.
+Deploy this repository root as a Node.js web service. Set MONGODB_URI and APP_PUBLISH_KEY as private environment variables; set MONGODB_DB=san_store. Never commit .env. The site and API are served together over HTTPS.
