@@ -463,9 +463,8 @@ app.put('/api/admin/developers/:id', requireAdmin, async (req, res) => {
   }
 });
 
-const publicDir = path.join(__dirname, 'public');
-app.use(express.static(publicDir, { extensions: ['html'], maxAge: '1h' }));
-app.get(/.*/, (_req, res) => res.sendFile(path.join(publicDir, 'index.html')));
+app.use(express.static(__dirname, { extensions: ['html'], maxAge: '1h' }));
+app.get(/.*/, (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
 async function start() {
   await client.connect();
