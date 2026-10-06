@@ -26,5 +26,11 @@ Crie um serviço web Node.js a partir desta pasta. Configure `npm install` como 
 
 A API oferece `GET /api/health`, `GET /api/apps` e `POST /api/apps` (protegido por chave). O card do SANBANK BR DIGITAL é inicializado no próprio catálogo; os outros apps são lidos do banco.
 
+## Contas SAN STORE (Android)
 
-Deploy this repository root as a Node.js web service. Set MONGODB_URI and APP_PUBLISH_KEY as private environment variables; set MONGODB_DB=san_store. Never commit .env. The site and API are served together over HTTPS.
+- `POST /api/auth/register` recebe `{ "account", "email", "password" }`; contas são normalizadas para minúsculas e o e-mail deve terminar em `@sanstore.com`. Retorna `{ "token", "user": { "account", "email" } }`.
+- `POST /api/auth/login` recebe `{ "identifier", "password" }`, aceitando nome da conta ou e-mail SAN STORE, e retorna o mesmo formato de sessão.
+- `GET /api/auth/me` exige `Authorization: Bearer <token>` e retorna os dados públicos da sessão.
+- `DELETE /api/auth/session` exige o mesmo token e encerra essa sessão.
+
+Nomes de conta: 3–20 caracteres, letras ASCII minúsculas, números, ponto, hífen ou sublinhado. Senhas: 8–10 caracteres, com pelo menos uma maiúscula, uma minúscula, um número e um símbolo. Os critérios são aplicados tanto no app quanto na API. Senhas são armazenadas como hashes scrypt com salt aleatório; tokens aleatórios de 30 dias são armazenados apenas como hashes SHA-256 e expiram automaticamente. Não há envio/verificação de e-mail configurado: `@sanstore.com` é um identificador da conta, não uma caixa postal.
