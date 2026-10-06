@@ -216,8 +216,8 @@ app.post('/api/apps', publishLimiter, publishAuth, async (req, res) => {
   }
 });
 
-app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'], maxAge: '1h' }));
-app.get(/.*/, (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.use(express.static(__dirname, { extensions: ['html'], maxAge: '1h' }));
+app.get(/.*/, (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
 async function start() {
   await client.connect();
