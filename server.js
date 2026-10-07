@@ -217,7 +217,11 @@ app.get('/api/admin/me', requireAdmin, (req, res) => {
 
 app.get('/api/developer/me', requireUser, (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ status: req.authUser.developerStatus || 'none', developerName: req.authUser.developerName || '' });
+  res.json({
+    status: req.authUser.developerStatus || 'none',
+    developerName: req.authUser.developerName || '',
+    developerAccount: req.authUser.account || '',
+  });
 });
 
 app.post('/api/developer/request', authLimiter, requireUser, async (req, res) => {
@@ -242,13 +246,14 @@ app.get('/api/health', readLimiter, async (_req, res) => {
 
 app.get('/api/apps', readLimiter, async (_req, res) => {
   try {
-    const docs = await appsCollection.find({ $or: [{ status: { $exists: false } }, { status: 'approved' }] }, { projection: { slug: 1, name: 1, category: 1, image: 1, apk: 1, description: 1, createdAt: 1, featured: 1 } })
+    const docs = await appsCollection.find({ $or: [{ status: { $exists: false } }, { status: 'approved' }] }, { projection: { slug: 1, name: 1, category: 1, image: 1, apk: 1, description: 1, createdAt: 1, featured: 1, developerName: 1, developerAccount: 1 } })
       .sort({ createdAt: -1 }).limit(500).toArray();
     res.set('Cache-Control', 'no-store');
     res.json(docs.map((doc) => ({
       id: doc.slug || doc._id.toString(), name: doc.name, category: doc.category,
       image: doc.image, apk: doc.apk, description: doc.description,
       featured: Boolean(doc.featured),
+      developerName: doc.developerName || doc.developerAccount || 'Publicador não informado',
     })));
   } catch (error) {
     console.error('Could not list apps:', error.message);
@@ -283,6 +288,8 @@ app.post('/api/submissions', publishLimiter, requireDeveloper, async (req, res) 
 // Legacy web submissions are also queued for review; this route can no longer publish directly.
 app.post('/api/apps', publishLimiter, publishAuth, async (req, res) => {
   const { name, category, image, apk, description } = req.body || {};
+  const developerName = typeof req.body?.developerName === 'string' ? req.body.developerName.trim() : '';
+  if (developerName.length > 80) return res.status(400).json({ error: 'O nome do publicador deve ter até 80 caracteres.' });
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
       !['App', 'Game'].includes(category) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
       typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) {
@@ -293,7 +300,7 @@ app.post('/api/apps', publishLimiter, publishAuth, async (req, res) => {
       name: name.trim(), category,
       image: new URL(image).href, apk: new URL(apk).href,
       description: description.trim(), status: 'pending',
-      submittedBy: null, developerAccount: 'web-publisher', developerName: 'Desenvolvedor da loja',
+      submittedBy: null, developerAccount: 'web-publisher', developerName: developerName || 'Desenvolvedor da loja',
       createdAt: new Date(), source: 'legacy-web-form',
     };
     const result = await submissionsCollection.insertOne(submission);
@@ -387,7 +394,7 @@ app.post('/api/admin/submissions/:id/approve', requireAdmin, async (req, res) =>
     const submissionId = id.toString();
     await appsCollection.updateOne(
       { submissionId },
-      { $set: { ...fields, slug: safeSlug(fields.name, id), submissionId, status: 'pending_publication', featured: false, developerAccount: submission.developerAccount || 'desenvolvedor-web' }, $setOnInsert: { createdAt: submission.createdAt || new Date() } },
+      { $set: { ...fields, slug: safeSlug(fields.name, id), submissionId, status: 'pending_publication', featured: false, developerAccount: submission.developerAccount || 'desenvolvedor-web', developerName: submission.developerName || submission.developerAccount || 'Publicador não informado' }, $setOnInsert: { createdAt: submission.createdAt || new Date() } },
       { upsert: true },
     );
     const publishedDoc = await appsCollection.findOne({ submissionId });
