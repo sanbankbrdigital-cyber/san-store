@@ -45,6 +45,11 @@ app.use(express.json({ limit: '20kb' }));
 const readLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 180, standardHeaders: 'draft-8', legacyHeaders: false });
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false });
 const publishLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false });
+const APP_SUBCATEGORIES = new Set(['Educação', 'Finanças', 'Ferramentas', 'Redes sociais', 'Entretenimento', 'Saúde', 'Produtividade']);
+
+function validSubcategory(value) {
+  return value === '' || APP_SUBCATEGORIES.has(value);
+}
 
 function validHttpsUrl(value) {
   if (typeof value !== 'string' || value.length > 2048) return false;
@@ -247,12 +252,12 @@ app.get('/api/health', readLimiter, async (_req, res) => {
 
 app.get('/api/apps', readLimiter, async (_req, res) => {
   try {
-    const docs = await appsCollection.find({ $or: [{ status: { $exists: false } }, { status: 'approved' }] }, { projection: { slug: 1, name: 1, category: 1, image: 1, apk: 1, description: 1, createdAt: 1, featured: 1, developerName: 1, developerAccount: 1 } })
+    const docs = await appsCollection.find({ $or: [{ status: { $exists: false } }, { status: 'approved' }] }, { projection: { slug: 1, name: 1, category: 1, subcategory: 1, image: 1, apk: 1, description: 1, createdAt: 1, featured: 1, developerName: 1, developerAccount: 1 } })
       .sort({ createdAt: -1 }).limit(500).toArray();
     res.set('Cache-Control', 'no-store');
     res.json(docs.map((doc) => ({
       id: doc.slug || doc._id.toString(), name: doc.name, category: doc.category,
-      image: doc.image, apk: doc.apk, description: doc.description,
+      subcategory: doc.subcategory || '', image: doc.image, apk: doc.apk, description: doc.description,
       featured: Boolean(doc.featured),
       developerName: doc.developerName || doc.developerAccount || 'Publicador não informado',
     })));
@@ -317,14 +322,15 @@ app.post('/api/apps/:appId/reviews', publishLimiter, requireUser, async (req, re
 
 app.post('/api/submissions', publishLimiter, requireDeveloper, async (req, res) => {
   const { name, category, image, apk, description } = req.body || {};
+  const subcategory = typeof req.body?.subcategory === 'string' ? req.body.subcategory.trim() : '';
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
-      !['App', 'Game'].includes(category) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
+      !['App', 'Game'].includes(category) || !validSubcategory(subcategory) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
       typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) {
-    return res.status(400).json({ error: 'Confira nome, categoria, links HTTPS e descrição.' });
+    return res.status(400).json({ error: 'Confira nome, tipo, categoria, links HTTPS e descrição.' });
   }
   try {
     const submission = {
-      name: name.trim(), category,
+      name: name.trim(), category, subcategory,
       image: new URL(image).href, apk: new URL(apk).href,
       description: description.trim(), status: 'pending',
       submittedBy: req.authUser._id, developerAccount: req.authUser.account,
@@ -342,16 +348,17 @@ app.post('/api/submissions', publishLimiter, requireDeveloper, async (req, res) 
 // Legacy web submissions are also queued for review; this route can no longer publish directly.
 app.post('/api/apps', publishLimiter, publishAuth, async (req, res) => {
   const { name, category, image, apk, description } = req.body || {};
+  const subcategory = typeof req.body?.subcategory === 'string' ? req.body.subcategory.trim() : '';
   const developerName = typeof req.body?.developerName === 'string' ? req.body.developerName.trim() : '';
   if (developerName.length > 80) return res.status(400).json({ error: 'O nome do publicador deve ter até 80 caracteres.' });
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
-      !['App', 'Game'].includes(category) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
+      !['App', 'Game'].includes(category) || !validSubcategory(subcategory) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
       typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) {
-    return res.status(400).json({ error: 'Confira nome, categoria, links HTTPS e descrição.' });
+    return res.status(400).json({ error: 'Confira nome, tipo, categoria, links HTTPS e descrição.' });
   }
   try {
     const submission = {
-      name: name.trim(), category,
+      name: name.trim(), category, subcategory,
       image: new URL(image).href, apk: new URL(apk).href,
       description: description.trim(), status: 'pending',
       submittedBy: null, developerAccount: 'web-publisher', developerName: developerName || 'Desenvolvedor da loja',
@@ -389,15 +396,16 @@ function safeSlug(value, id) {
 
 function submissionPayload(body) {
   const { name, category, image, apk, description } = body || {};
+  const subcategory = typeof body?.subcategory === 'string' ? body.subcategory.trim() : '';
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
-      !['App', 'Game'].includes(category) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
+      !['App', 'Game'].includes(category) || !validSubcategory(subcategory) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
       typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) return null;
-  return { name: name.trim(), category, image: new URL(image).href, apk: new URL(apk).href, description: description.trim() };
+  return { name: name.trim(), category, subcategory, image: new URL(image).href, apk: new URL(apk).href, description: description.trim() };
 }
 
 function submissionJson(doc) {
   return {
-    id: doc._id.toString(), name: doc.name, category: doc.category, image: doc.image,
+    id: doc._id.toString(), name: doc.name, category: doc.category, subcategory: doc.subcategory || '', image: doc.image,
     apk: doc.apk, description: doc.description, status: doc.status,
     developerAccount: doc.developerAccount || 'desenvolvedor-web',
     developerName: doc.developerName || doc.developerAccount || 'Desenvolvedor',
@@ -434,8 +442,11 @@ app.put('/api/admin/submissions/:id', requireAdmin, async (req, res) => {
   const id = parseObjectId(req.params.id);
   const payload = submissionPayload(req.body);
   if (!id) return res.status(400).json({ error: 'Identificador inválido.' });
-  if (!payload) return res.status(400).json({ error: 'Confira nome, categoria, links HTTPS e descrição.' });
+  if (!payload) return res.status(400).json({ error: 'Confira nome, tipo, categoria, links HTTPS e descrição.' });
   try {
+    const current = await submissionsCollection.findOne({ _id: id, status: 'pending' }, { projection: { subcategory: 1 } });
+    if (!current) return res.status(409).json({ error: 'Só é possível editar publicações aguardando análise.' });
+    if (typeof req.body?.subcategory !== 'string') payload.subcategory = current.subcategory || '';
     const result = await submissionsCollection.updateOne(
       { _id: id, status: 'pending' },
       { $set: { ...payload, editedAt: new Date(), editedBy: req.authUser._id } },
@@ -571,7 +582,7 @@ async function start() {
   await appsCollection.updateOne(
     { slug: 'sanbank-br-digital' },
     { $setOnInsert: {
-      slug: 'sanbank-br-digital', name: 'SANBANK BR DIGITAL', category: 'App',
+      slug: 'sanbank-br-digital', name: 'SANBANK BR DIGITAL', category: 'App', subcategory: 'Finanças',
       image: 'https://i.ibb.co/Ld27J25H/shared-image-3.webp',
       apk: 'https://github.com/sanbankbrdigital-cyber/san-store/raw/refs/heads/main/SANBANK-BR-DIGITAL-NATIVO-COMPLETO-v3.1.51-sem-top-interbank-icon-ANDROID-5.0-A-17.apk',
       description: 'Aplicativo SANBANK BR DIGITAL para Android. Baixe e conheça os recursos do seu banco digital.',
@@ -579,6 +590,11 @@ async function start() {
     } },
     { upsert: true },
   );
+  await Promise.all([
+    appsCollection.updateMany({ category: 'Game', subcategory: { $in: [null, ''] } }, { $set: { subcategory: 'Entretenimento' } }),
+    appsCollection.updateMany({ category: 'App', name: /bank/i, subcategory: { $in: [null, ''] } }, { $set: { subcategory: 'Finanças' } }),
+    appsCollection.updateMany({ category: 'App', name: /launch/i, subcategory: { $in: [null, ''] } }, { $set: { subcategory: 'Ferramentas' } }),
+  ]);
   app.listen(port, '0.0.0.0', () => console.log(`SAN STORE online on port ${port}`));
 }
 start().catch((error) => {
