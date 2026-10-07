@@ -22,6 +22,7 @@ let appsCollection;
 let usersCollection;
 let sessionsCollection;
 let submissionsCollection;
+let reviewsCollection;
 let settingsCollection;
 let dummyPasswordHash;
 app.disable('x-powered-by');
@@ -261,6 +262,59 @@ app.get('/api/apps', readLimiter, async (_req, res) => {
   }
 });
 
+app.get('/api/apps/:appId/reviews', readLimiter, async (req, res) => {
+  const appId = String(req.params.appId || '');
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(appId)) return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
+  try {
+    const storeApp = await findPublishedAppByPublicId(appId);
+    if (!storeApp) return res.status(404).json({ error: 'Aplicativo não encontrado na loja.' });
+    const [stats] = await reviewsCollection.aggregate([
+      { $match: { appId } },
+      { $group: { _id: null, averageRating: { $avg: '$rating' }, reviewCount: { $sum: 1 } } },
+    ]).toArray();
+    const docs = await reviewsCollection.find({ appId })
+      .sort({ updatedAt: -1 }).limit(50).toArray();
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      appId,
+      averageRating: stats ? Math.round(stats.averageRating * 10) / 10 : 0,
+      reviewCount: stats?.reviewCount || 0,
+      reviews: docs.map((review) => ({
+        rating: review.rating,
+        reviewerName: review.reviewerName || 'Usuário',
+        comment: review.comment,
+        createdAt: review.updatedAt || review.createdAt || null,
+      })),
+    });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível carregar as avaliações agora.' });
+  }
+});
+
+app.post('/api/apps/:appId/reviews', publishLimiter, requireUser, async (req, res) => {
+  const appId = String(req.params.appId || '');
+  const rating = Number(req.body?.rating);
+  const comment = typeof req.body?.comment === 'string' ? req.body.comment.trim() : '';
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(appId)) return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ error: 'Escolha uma nota de 1 a 5 estrelas.' });
+  if (comment.length < 3 || comment.length > 500) return res.status(400).json({ error: 'A avaliação deve ter de 3 a 500 caracteres.' });
+  try {
+    const storeApp = await findPublishedAppByPublicId(appId);
+    if (!storeApp) return res.status(404).json({ error: 'Aplicativo não encontrado na loja.' });
+    const now = new Date();
+    await reviewsCollection.updateOne(
+      { appId, userId: req.authUser._id },
+      { $set: { rating, comment, reviewerName: req.authUser.developerName || req.authUser.account || 'Usuário', updatedAt: now },
+        $setOnInsert: { createdAt: now } },
+      { upsert: true },
+    );
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, message: 'Sua avaliação foi publicada.' });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível publicar a avaliação agora.' });
+  }
+});
+
 app.post('/api/submissions', publishLimiter, requireDeveloper, async (req, res) => {
   const { name, category, image, apk, description } = req.body || {};
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
@@ -313,6 +367,18 @@ app.post('/api/apps', publishLimiter, publishAuth, async (req, res) => {
 
 function parseObjectId(value) {
   return ObjectId.isValid(value) ? new ObjectId(value) : null;
+}
+
+async function findPublishedAppByPublicId(appId) {
+  const identifiers = [{ slug: appId }];
+  const objectId = parseObjectId(appId);
+  if (objectId) identifiers.push({ _id: objectId });
+  return appsCollection.findOne({
+    $and: [
+      { $or: [{ status: { $exists: false } }, { status: 'approved' }] },
+      { $or: identifiers },
+    ],
+  });
 }
 
 function safeSlug(value, id) {
@@ -480,6 +546,7 @@ async function start() {
   usersCollection = db.collection('users');
   sessionsCollection = db.collection('sessions');
   submissionsCollection = db.collection('submissions');
+  reviewsCollection = db.collection('app_reviews');
   settingsCollection = db.collection('settings');
   dummyPasswordHash = await hashPassword(crypto.randomBytes(32).toString('hex'));
   await Promise.all([
@@ -493,6 +560,8 @@ async function start() {
     sessionsCollection.createIndex({ userId: 1 }),
     submissionsCollection.createIndex({ status: 1, createdAt: -1 }),
     submissionsCollection.createIndex({ submittedBy: 1, createdAt: -1 }),
+    reviewsCollection.createIndex({ appId: 1, userId: 1 }, { unique: true }),
+    reviewsCollection.createIndex({ appId: 1, updatedAt: -1 }),
   ]);
   await settingsCollection.updateOne(
     { _id: 'admin_bootstrap' },
