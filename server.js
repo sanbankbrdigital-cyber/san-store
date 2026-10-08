@@ -230,6 +230,40 @@ app.get('/api/developer/me', requireUser, (req, res) => {
   });
 });
 
+app.get('/api/developer/apps', requireDeveloper, async (req, res) => {
+  try {
+    const docs = await appsCollection.find({
+      developerAccount: req.authUser.account,
+      $or: [{ status: { $exists: false } }, { status: 'approved' }],
+    }, { projection: { slug: 1, name: 1, category: 1, subcategory: 1, image: 1, apk: 1, description: 1, whatsNew: 1, featured: 1, developerName: 1 } })
+      .sort({ createdAt: -1 }).limit(200).toArray();
+    const ids = docs.map((doc) => doc._id);
+    const updates = ids.length
+      ? await submissionsCollection.find({ targetAppId: { $in: ids }, submissionType: 'update' }).sort({ createdAt: -1 }).toArray()
+      : [];
+    const latestByApp = new Map();
+    for (const update of updates) {
+      const key = update.targetAppId.toString();
+      if (!latestByApp.has(key)) latestByApp.set(key, update);
+    }
+    res.set('Cache-Control', 'no-store');
+    return res.json(docs.map((doc) => {
+      const latest = latestByApp.get(doc._id.toString());
+      return {
+        id: doc.slug || doc._id.toString(), name: doc.name, category: doc.category,
+        subcategory: doc.subcategory || '', image: doc.image, apk: doc.apk, description: doc.description,
+        whatsNew: doc.whatsNew || '', featured: Boolean(doc.featured),
+        developerName: doc.developerName || req.authUser.developerName || req.authUser.account,
+        pendingUpdate: Boolean(latest && latest.status === 'pending'),
+        latestUpdateStatus: latest?.status || '',
+        rejectionReason: latest?.status === 'rejected' ? latest.rejectionReason || '' : '',
+      };
+    }));
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível carregar seus aplicativos publicados.' });
+  }
+});
+
 app.post('/api/developer/request', authLimiter, requireUser, async (req, res) => {
   try {
     if (req.authUser.developerStatus === 'active') return res.json({ status: 'active' });
@@ -252,13 +286,13 @@ app.get('/api/health', readLimiter, async (_req, res) => {
 
 app.get('/api/apps', readLimiter, async (_req, res) => {
   try {
-    const docs = await appsCollection.find({ $or: [{ status: { $exists: false } }, { status: 'approved' }] }, { projection: { slug: 1, name: 1, category: 1, subcategory: 1, image: 1, apk: 1, description: 1, createdAt: 1, featured: 1, developerName: 1, developerAccount: 1 } })
+    const docs = await appsCollection.find({ $or: [{ status: { $exists: false } }, { status: 'approved' }] }, { projection: { slug: 1, name: 1, category: 1, subcategory: 1, image: 1, apk: 1, description: 1, whatsNew: 1, createdAt: 1, featured: 1, developerName: 1, developerAccount: 1 } })
       .sort({ createdAt: -1 }).limit(500).toArray();
     res.set('Cache-Control', 'no-store');
     res.json(docs.map((doc) => ({
       id: doc.slug || doc._id.toString(), name: doc.name, category: doc.category,
       subcategory: doc.subcategory || '', image: doc.image, apk: doc.apk, description: doc.description,
-      featured: Boolean(doc.featured),
+      whatsNew: doc.whatsNew || '', featured: Boolean(doc.featured),
       developerName: doc.developerName || doc.developerAccount || 'Publicador não informado',
     })));
   } catch (error) {
@@ -321,26 +355,45 @@ app.post('/api/apps/:appId/reviews', publishLimiter, requireUser, async (req, re
 });
 
 app.post('/api/submissions', publishLimiter, requireDeveloper, async (req, res) => {
-  const { name, category, image, apk, description } = req.body || {};
-  const subcategory = typeof req.body?.subcategory === 'string' ? req.body.subcategory.trim() : '';
-  if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
-      !['App', 'Game'].includes(category) || !validSubcategory(subcategory) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
-      typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) {
-    return res.status(400).json({ error: 'Confira nome, tipo, categoria, links HTTPS e descrição.' });
+  const payload = submissionPayload(req.body);
+  if (!payload) return res.status(400).json({ error: 'Confira nome, tipo, categoria, links HTTPS, descrição e novidades (até 500 caracteres).' });
+  const requestedAppId = typeof req.body?.appId === 'string' ? req.body.appId.trim() : '';
+  if (requestedAppId && !/^[A-Za-z0-9_-]{1,120}$/.test(requestedAppId)) {
+    return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
   }
   try {
+    let targetApp = null;
+    if (requestedAppId) {
+      targetApp = await findPublishedAppByPublicId(requestedAppId);
+      if (!targetApp || targetApp.developerAccount !== req.authUser.account) {
+        return res.status(404).json({ error: 'Aplicativo publicado não encontrado nesta conta de desenvolvedor.' });
+      }
+      const pendingUpdate = await submissionsCollection.findOne({
+        targetAppId: targetApp._id, submissionType: 'update', status: 'pending',
+      }, { projection: { _id: 1 } });
+      if (pendingUpdate) return res.status(409).json({ error: 'Já existe uma atualização deste aplicativo aguardando aprovação.' });
+      payload.name = targetApp.name;
+      payload.category = targetApp.category;
+      payload.subcategory = targetApp.subcategory || '';
+    }
     const submission = {
-      name: name.trim(), category, subcategory,
-      image: new URL(image).href, apk: new URL(apk).href,
-      description: description.trim(), status: 'pending',
-      submittedBy: req.authUser._id, developerAccount: req.authUser.account,
+      ...payload,
+      status: 'pending',
+      submissionType: targetApp ? 'update' : 'new',
+      submittedBy: req.authUser._id,
+      developerAccount: req.authUser.account,
       developerName: req.authUser.developerName || req.authUser.account,
       createdAt: new Date(),
     };
+    if (targetApp) submission.targetAppId = targetApp._id;
     const result = await submissionsCollection.insertOne(submission);
     res.set('Cache-Control', 'no-store');
-    return res.status(202).json({ id: result.insertedId.toString(), status: 'pending', message: 'Enviado para aprovação do administrador.' });
-  } catch {
+    return res.status(202).json({
+      id: result.insertedId.toString(), status: 'pending', submissionType: submission.submissionType,
+      message: targetApp ? 'Atualização enviada para aprovação do administrador.' : 'Enviado para aprovação do administrador.',
+    });
+  } catch (error) {
+    if (error && error.code === 11000) return res.status(409).json({ error: 'Já existe uma atualização deste aplicativo aguardando aprovação.' });
     return res.status(503).json({ error: 'Não foi possível enviar para aprovação agora.' });
   }
 });
@@ -349,8 +402,9 @@ app.post('/api/submissions', publishLimiter, requireDeveloper, async (req, res) 
 app.post('/api/apps', publishLimiter, publishAuth, async (req, res) => {
   const { name, category, image, apk, description } = req.body || {};
   const subcategory = typeof req.body?.subcategory === 'string' ? req.body.subcategory.trim() : '';
+  const whatsNew = typeof req.body?.whatsNew === 'string' ? req.body.whatsNew.trim() : '';
   const developerName = typeof req.body?.developerName === 'string' ? req.body.developerName.trim() : '';
-  if (developerName.length > 80) return res.status(400).json({ error: 'O nome do publicador deve ter até 80 caracteres.' });
+  if (developerName.length > 80 || whatsNew.length > 500) return res.status(400).json({ error: 'O nome do publicador deve ter até 80 caracteres e as novidades até 500.' });
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
       !['App', 'Game'].includes(category) || !validSubcategory(subcategory) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
       typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) {
@@ -360,7 +414,7 @@ app.post('/api/apps', publishLimiter, publishAuth, async (req, res) => {
     const submission = {
       name: name.trim(), category, subcategory,
       image: new URL(image).href, apk: new URL(apk).href,
-      description: description.trim(), status: 'pending',
+      description: description.trim(), whatsNew, status: 'pending', submissionType: 'new',
       submittedBy: null, developerAccount: 'web-publisher', developerName: developerName || 'Desenvolvedor da loja',
       createdAt: new Date(), source: 'legacy-web-form',
     };
@@ -397,16 +451,19 @@ function safeSlug(value, id) {
 function submissionPayload(body) {
   const { name, category, image, apk, description } = body || {};
   const subcategory = typeof body?.subcategory === 'string' ? body.subcategory.trim() : '';
+  const whatsNew = typeof body?.whatsNew === 'string' ? body.whatsNew.trim() : '';
+  if (whatsNew.length > 500) return null;
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
       !['App', 'Game'].includes(category) || !validSubcategory(subcategory) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
       typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) return null;
-  return { name: name.trim(), category, subcategory, image: new URL(image).href, apk: new URL(apk).href, description: description.trim() };
+  return { name: name.trim(), category, subcategory, image: new URL(image).href, apk: new URL(apk).href, description: description.trim(), whatsNew };
 }
 
 function submissionJson(doc) {
   return {
     id: doc._id.toString(), name: doc.name, category: doc.category, subcategory: doc.subcategory || '', image: doc.image,
-    apk: doc.apk, description: doc.description, status: doc.status,
+    apk: doc.apk, description: doc.description, whatsNew: doc.whatsNew || '', status: doc.status,
+    submissionType: doc.submissionType || 'new', targetAppId: doc.targetAppId ? doc.targetAppId.toString() : '',
     developerAccount: doc.developerAccount || 'desenvolvedor-web',
     developerName: doc.developerName || doc.developerAccount || 'Desenvolvedor',
     createdAt: doc.createdAt || null, rejectionReason: doc.rejectionReason || '',
@@ -444,9 +501,10 @@ app.put('/api/admin/submissions/:id', requireAdmin, async (req, res) => {
   if (!id) return res.status(400).json({ error: 'Identificador inválido.' });
   if (!payload) return res.status(400).json({ error: 'Confira nome, tipo, categoria, links HTTPS e descrição.' });
   try {
-    const current = await submissionsCollection.findOne({ _id: id, status: 'pending' }, { projection: { subcategory: 1 } });
+    const current = await submissionsCollection.findOne({ _id: id, status: 'pending' }, { projection: { subcategory: 1, whatsNew: 1 } });
     if (!current) return res.status(409).json({ error: 'Só é possível editar publicações aguardando análise.' });
     if (typeof req.body?.subcategory !== 'string') payload.subcategory = current.subcategory || '';
+    if (typeof req.body?.whatsNew !== 'string') payload.whatsNew = current.whatsNew || '';
     const result = await submissionsCollection.updateOne(
       { _id: id, status: 'pending' },
       { $set: { ...payload, editedAt: new Date(), editedBy: req.authUser._id } },
@@ -468,6 +526,31 @@ app.post('/api/admin/submissions/:id/approve', requireAdmin, async (req, res) =>
     if (submission.status === 'rejected') return res.status(409).json({ error: 'Uma publicação recusada não pode ser aprovada.' });
     const fields = submissionPayload(submission);
     if (!fields) return res.status(400).json({ error: 'Os dados da publicação estão incompletos.' });
+    const reviewedAt = new Date();
+
+    if (submission.submissionType === 'update') {
+      const targetId = submission.targetAppId;
+      if (!targetId) return res.status(409).json({ error: 'O aplicativo original desta atualização não foi encontrado.' });
+      const target = await appsCollection.findOne({ _id: targetId, developerAccount: submission.developerAccount, $or: [{ status: { $exists: false } }, { status: 'approved' }] });
+      if (!target) return res.status(409).json({ error: 'O aplicativo original não está mais publicado nesta conta.' });
+      const claim = await submissionsCollection.updateOne(
+        { _id: id, status: 'pending' },
+        { $set: { status: 'approved', approvedAppId: target._id, reviewedAt, reviewedBy: req.authUser._id } },
+      );
+      if (claim.matchedCount !== 1) return res.status(409).json({ error: 'A atualização mudou de estado. Atualize a lista e tente novamente.' });
+      // Update only listing metadata: _id, public slug, reviews, and featured status remain untouched.
+      const updated = await appsCollection.updateOne(
+        { _id: target._id, developerAccount: submission.developerAccount, $or: [{ status: { $exists: false } }, { status: 'approved' }] },
+        { $set: { image: fields.image, apk: fields.apk, description: fields.description, whatsNew: fields.whatsNew, updatedAt: reviewedAt } },
+      );
+      if (updated.matchedCount !== 1) {
+        await submissionsCollection.updateOne({ _id: id, status: 'approved' }, { $set: { status: 'pending' }, $unset: { approvedAppId: '', reviewedAt: '', reviewedBy: '' } });
+        return res.status(409).json({ error: 'O aplicativo original mudou de estado; a atualização continua aguardando análise.' });
+      }
+      res.set('Cache-Control', 'no-store');
+      return res.json({ ok: true, status: 'approved', submissionType: 'update', appId: target.slug || target._id.toString() });
+    }
+
     const submissionId = id.toString();
     await appsCollection.updateOne(
       { submissionId },
@@ -475,7 +558,6 @@ app.post('/api/admin/submissions/:id/approve', requireAdmin, async (req, res) =>
       { upsert: true },
     );
     const publishedDoc = await appsCollection.findOne({ submissionId });
-    const reviewedAt = new Date();
     if (submission.status !== 'approved') {
       const result = await submissionsCollection.updateOne(
         { _id: id, status: 'pending' },
@@ -571,6 +653,7 @@ async function start() {
     sessionsCollection.createIndex({ userId: 1 }),
     submissionsCollection.createIndex({ status: 1, createdAt: -1 }),
     submissionsCollection.createIndex({ submittedBy: 1, createdAt: -1 }),
+    submissionsCollection.createIndex({ targetAppId: 1 }, { unique: true, partialFilterExpression: { status: 'pending', submissionType: 'update' } }),
     reviewsCollection.createIndex({ appId: 1, userId: 1 }, { unique: true }),
     reviewsCollection.createIndex({ appId: 1, updatedAt: -1 }),
   ]);
