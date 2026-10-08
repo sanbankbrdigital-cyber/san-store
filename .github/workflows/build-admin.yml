@@ -3,7 +3,7 @@ name: Build SAN STORE Admin APK
 on:
   push:
     paths:
-      - 'SAN-STORE-ADMIN-CORRIGIDO-FONTE-v1.1.0.zip'
+      - 'SAN-STORE-ADMIN-CORRIGIDO-FONTE-v1.2.0.zip'
       - '.github/workflows/build-admin.yml'
   workflow_dispatch:
 
@@ -37,13 +37,13 @@ jobs:
       - name: Build debug APK
         run: |
           mkdir -p "$RUNNER_TEMP/admin-source"
-          unzip -q 'SAN-STORE-ADMIN-CORRIGIDO-FONTE-v1.1.0.zip' -d "$RUNNER_TEMP/admin-source"
-          cd "$RUNNER_TEMP/admin-source/SAN-STORE-ADMIN-CORRIGIDO-v1.1.0/FONTE/SAN_STORE_ADMIN_ANDROID"
+          unzip -q 'SAN-STORE-ADMIN-CORRIGIDO-FONTE-v1.2.0.zip' -d "$RUNNER_TEMP/admin-source"
+          cd "$RUNNER_TEMP/admin-source/SAN-STORE-ADMIN-CORRIGIDO-v1.2.0/FONTE/SAN_STORE_ADMIN_ANDROID"
           "$RUNNER_TEMP/gradle-8.13/bin/gradle" --no-daemon assembleDebug
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: SAN-STORE-ADMIN-APK-v1.1.0
-          path: ${{ runner.temp }}/admin-source/SAN-STORE-ADMIN-CORRIGIDO-v1.1.0/FONTE/SAN_STORE_ADMIN_ANDROID/app/build/outputs/apk/debug/app-debug.apk
+          name: SAN-STORE-ADMIN-APK-v1.2.0
+          path: ${{ runner.temp }}/admin-source/SAN-STORE-ADMIN-CORRIGIDO-v1.2.0/FONTE/SAN_STORE_ADMIN_ANDROID/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
