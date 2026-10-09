@@ -23,6 +23,7 @@ let usersCollection;
 let sessionsCollection;
 let submissionsCollection;
 let reviewsCollection;
+let appAppealsCollection;
 let settingsCollection;
 let dummyPasswordHash;
 app.disable('x-powered-by');
@@ -277,6 +278,89 @@ app.post('/api/admin/apps/:appId/unblock', requireAdmin, async (req, res) => {
   }
 });
 
+function appealJson(doc) {
+  return {
+    id: doc._id.toString(), appId: doc.publicAppId || doc.appId.toString(),
+    appName: doc.appName || 'Aplicativo', developerAccount: doc.developerAccount || '',
+    developerName: doc.developerName || doc.developerAccount || 'Desenvolvedor',
+    message: doc.message || '', status: doc.status || 'pending',
+    createdAt: doc.createdAt || null, reviewedAt: doc.reviewedAt || null,
+    reviewReason: doc.reviewReason || '',
+  };
+}
+
+app.get('/api/admin/appeals', requireAdmin, async (req, res) => {
+  try {
+    const requestedStatus = String(req.query.status || 'pending');
+    const query = requestedStatus === 'all' ? {} : { status: ['pending', 'approved', 'rejected'].includes(requestedStatus) ? requestedStatus : 'pending' };
+    const docs = await appAppealsCollection.find(query).sort({ createdAt: -1 }).limit(300).toArray();
+    res.set('Cache-Control', 'no-store');
+    return res.json(docs.map(appealJson));
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível carregar as apelações.' });
+  }
+});
+
+app.post('/api/admin/appeals/:id/approve', requireAdmin, async (req, res) => {
+  const id = parseObjectId(req.params.id);
+  const reviewReason = typeof req.body?.reviewReason === 'string' ? req.body.reviewReason.trim().slice(0, 300) : '';
+  if (!id) return res.status(400).json({ error: 'Identificador da apelação inválido.' });
+  try {
+    const appeal = await appAppealsCollection.findOne({ _id: id, status: 'pending' });
+    if (!appeal) return res.status(404).json({ error: 'Apelação pendente não encontrada.' });
+    const claim = await appAppealsCollection.updateOne(
+      { _id: id, status: 'pending' },
+      { $set: { status: 'approved', reviewedAt: new Date(), reviewedBy: req.authUser._id, reviewReason } },
+    );
+    if (claim.matchedCount !== 1) return res.status(409).json({ error: 'Esta apelação já foi analisada.' });
+    const unblocked = await appsCollection.updateOne(
+      { _id: appeal.appId, developerAccount: appeal.developerAccount, blocked: true, $or: [{ status: { $exists: false } }, { status: 'approved' }] },
+      { $set: { blocked: false }, $unset: { blockReason: '', blockedAt: '', blockedBy: '' } },
+    );
+    if (unblocked.matchedCount !== 1) {
+      await appAppealsCollection.updateOne(
+        { _id: id, status: 'approved', reviewedBy: req.authUser._id },
+        { $set: { status: 'pending' }, $unset: { reviewedAt: '', reviewedBy: '', reviewReason: '' } },
+      );
+      return res.status(409).json({ error: 'O app não está mais bloqueado; atualize a lista de apelações.' });
+    }
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, status: 'approved', appId: appeal.publicAppId, message: 'Apelação aprovada; downloads liberados.' });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível aprovar a apelação agora.' });
+  }
+});
+
+app.post('/api/admin/appeals/:id/reject', requireAdmin, async (req, res) => {
+  const id = parseObjectId(req.params.id);
+  const reviewReason = typeof req.body?.reviewReason === 'string' ? req.body.reviewReason.trim().slice(0, 300) : '';
+  if (!id) return res.status(400).json({ error: 'Identificador da apelação inválido.' });
+  try {
+    const appeal = await appAppealsCollection.findOne({ _id: id, status: 'pending' });
+    if (!appeal) return res.status(404).json({ error: 'Apelação pendente não encontrada.' });
+    const claim = await appAppealsCollection.updateOne(
+      { _id: id, status: 'pending' },
+      { $set: { status: 'rejected', reviewedAt: new Date(), reviewedBy: req.authUser._id, reviewReason } },
+    );
+    if (claim.matchedCount !== 1) return res.status(409).json({ error: 'Esta apelação já foi analisada.' });
+    const removal = await appsCollection.updateOne(
+      { _id: appeal.appId, developerAccount: appeal.developerAccount, blocked: true, $or: [{ status: { $exists: false } }, { status: 'approved' }] },
+      { $set: { status: 'removed', blocked: true, removedAt: new Date(), removedBy: req.authUser._id, removalReason: reviewReason || 'Apelação de desbloqueio recusada.' } },
+    );
+    if (removal.matchedCount !== 1) {
+      await appAppealsCollection.updateOne(
+        { _id: id, status: 'rejected', reviewedBy: req.authUser._id },
+        { $set: { status: 'pending' }, $unset: { reviewedAt: '', reviewedBy: '', reviewReason: '' } },
+      );
+      return res.status(409).json({ error: 'O app mudou de estado; atualize a lista de apelações.' });
+    }
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, status: 'rejected', appId: appeal.publicAppId, removed: true, message: 'Apelação recusada; app removido do catálogo.' });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível recusar a apelação agora.' });
+  }
+});
+
 app.get('/api/developer/me', requireUser, (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({
@@ -290,26 +374,42 @@ app.get('/api/developer/apps', requireDeveloper, async (req, res) => {
   try {
     const docs = await appsCollection.find({
       developerAccount: req.authUser.account,
-      $or: [{ status: { $exists: false } }, { status: 'approved' }],
-    }, { projection: { slug: 1, name: 1, category: 1, subcategory: 1, image: 1, apk: 1, description: 1, whatsNew: 1, featured: 1, developerName: 1 } })
+      $or: [{ status: { $exists: false } }, { status: 'approved' }, { status: 'removed' }],
+    }, { projection: { slug: 1, name: 1, category: 1, subcategory: 1, image: 1, apk: 1, description: 1, whatsNew: 1, featured: 1, developerName: 1, status: 1, blocked: 1, blockReason: 1 } })
       .sort({ createdAt: -1 }).limit(200).toArray();
     const ids = docs.map((doc) => doc._id);
     const updates = ids.length
       ? await submissionsCollection.find({ targetAppId: { $in: ids }, submissionType: 'update' }).sort({ createdAt: -1 }).toArray()
+      : [];
+    const appeals = ids.length
+      ? await appAppealsCollection.find({ appId: { $in: ids }, developerAccount: req.authUser.account }).sort({ createdAt: -1 }).toArray()
       : [];
     const latestByApp = new Map();
     for (const update of updates) {
       const key = update.targetAppId.toString();
       if (!latestByApp.has(key)) latestByApp.set(key, update);
     }
+    const latestAppealByApp = new Map();
+    for (const appeal of appeals) {
+      const key = appeal.appId.toString();
+      if (!latestAppealByApp.has(key)) latestAppealByApp.set(key, appeal);
+    }
     res.set('Cache-Control', 'no-store');
     return res.json(docs.map((doc) => {
-      const latest = latestByApp.get(doc._id.toString());
+      const appKey = doc._id.toString();
+      const latest = latestByApp.get(appKey);
+      const appeal = latestAppealByApp.get(appKey);
+      const removed = doc.status === 'removed';
       return {
-        id: doc.slug || doc._id.toString(), name: doc.name, category: doc.category,
-        subcategory: doc.subcategory || '', image: doc.image, apk: doc.apk, description: doc.description,
+        id: doc.slug || appKey, name: doc.name, category: doc.category,
+        subcategory: doc.subcategory || '', image: doc.image,
+        apk: doc.blocked || removed ? '' : doc.apk, description: doc.description,
         whatsNew: doc.whatsNew || '', featured: Boolean(doc.featured),
         developerName: doc.developerName || req.authUser.developerName || req.authUser.account,
+        blocked: Boolean(doc.blocked), blockReason: doc.blockReason || '',
+        status: doc.status || 'approved', removed,
+        appealStatus: appeal?.status || '', appealId: appeal?._id.toString() || '',
+        appealMessage: appeal?.message || '', appealReviewReason: appeal?.reviewReason || '',
         pendingUpdate: Boolean(latest && latest.status === 'pending'),
         latestUpdateStatus: latest?.status || '',
         rejectionReason: latest?.status === 'rejected' ? latest.rejectionReason || '' : '',
@@ -317,6 +417,33 @@ app.get('/api/developer/apps', requireDeveloper, async (req, res) => {
     }));
   } catch {
     return res.status(503).json({ error: 'Não foi possível carregar seus aplicativos publicados.' });
+  }
+});
+
+app.post('/api/developer/apps/:appId/appeal', publishLimiter, requireDeveloper, async (req, res) => {
+  const appId = String(req.params.appId || '');
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(appId)) return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
+  if (message.length < 10 || message.length > 1000) return res.status(400).json({ error: 'Explique o pedido em 10 a 1000 caracteres.' });
+  try {
+    const storeApp = await findPublishedAppByPublicId(appId);
+    if (!storeApp || storeApp.developerAccount !== req.authUser.account) return res.status(404).json({ error: 'Aplicativo bloqueado não encontrado nesta conta.' });
+    if (!storeApp.blocked) return res.status(409).json({ error: 'Este aplicativo não está bloqueado; não precisa de apelação.' });
+    const pending = await appAppealsCollection.findOne({ appId: storeApp._id, status: 'pending' });
+    if (pending) return res.status(409).json({ error: 'Já existe uma apelação aguardando análise para este aplicativo.' });
+    const now = new Date();
+    const appeal = {
+      appId: storeApp._id, publicAppId: storeApp.slug || storeApp._id.toString(),
+      appName: storeApp.name, developerAccount: req.authUser.account,
+      developerName: storeApp.developerName || req.authUser.developerName || req.authUser.account,
+      message, status: 'pending', createdAt: now, submittedBy: req.authUser._id,
+    };
+    const result = await appAppealsCollection.insertOne(appeal);
+    res.set('Cache-Control', 'no-store');
+    return res.status(202).json({ id: result.insertedId.toString(), status: 'pending', message: 'Apelação enviada para análise do administrador.' });
+  } catch (error) {
+    if (error && error.code === 11000) return res.status(409).json({ error: 'Já existe uma apelação aguardando análise para este aplicativo.' });
+    return res.status(503).json({ error: 'Não foi possível enviar a apelação agora.' });
   }
 });
 
@@ -697,6 +824,7 @@ async function start() {
   sessionsCollection = db.collection('sessions');
   submissionsCollection = db.collection('submissions');
   reviewsCollection = db.collection('app_reviews');
+  appAppealsCollection = db.collection('app_appeals');
   settingsCollection = db.collection('settings');
   dummyPasswordHash = await hashPassword(crypto.randomBytes(32).toString('hex'));
   await Promise.all([
@@ -713,6 +841,9 @@ async function start() {
     submissionsCollection.createIndex({ targetAppId: 1 }, { unique: true, partialFilterExpression: { status: 'pending', submissionType: 'update' } }),
     reviewsCollection.createIndex({ appId: 1, userId: 1 }, { unique: true }),
     reviewsCollection.createIndex({ appId: 1, updatedAt: -1 }),
+    appAppealsCollection.createIndex({ status: 1, createdAt: -1 }),
+    appAppealsCollection.createIndex({ appId: 1, createdAt: -1 }),
+    appAppealsCollection.createIndex({ appId: 1 }, { unique: true, partialFilterExpression: { status: 'pending' } }),
   ]);
   await settingsCollection.updateOne(
     { _id: 'admin_bootstrap' },
