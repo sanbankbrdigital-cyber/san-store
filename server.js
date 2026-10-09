@@ -221,6 +221,62 @@ app.get('/api/admin/me', requireAdmin, (req, res) => {
   res.json({ user: { account: req.authUser.account, email: req.authUser.email, role: 'admin' } });
 });
 
+app.get('/api/admin/apps', requireAdmin, async (_req, res) => {
+  try {
+    const docs = await appsCollection.find(
+      { $or: [{ status: { $exists: false } }, { status: 'approved' }] },
+      { projection: { slug: 1, name: 1, category: 1, subcategory: 1, image: 1, developerName: 1, developerAccount: 1, blocked: 1, blockReason: 1, createdAt: 1 } },
+    ).sort({ createdAt: -1 }).limit(500).toArray();
+    res.set('Cache-Control', 'no-store');
+    return res.json(docs.map((doc) => ({
+      id: doc.slug || doc._id.toString(), name: doc.name, category: doc.category,
+      subcategory: doc.subcategory || '', image: doc.image,
+      developerName: doc.developerName || doc.developerAccount || 'Publicador não informado',
+      blocked: Boolean(doc.blocked), blockReason: doc.blockReason || '',
+    })));
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível carregar os aplicativos da loja.' });
+  }
+});
+
+app.post('/api/admin/apps/:appId/block', requireAdmin, async (req, res) => {
+  const appId = String(req.params.appId || '');
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(appId)) return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
+  if (reason.length > 300) return res.status(400).json({ error: 'O aviso pode ter até 300 caracteres.' });
+  try {
+    const doc = await findPublishedAppByPublicId(appId);
+    if (!doc) return res.status(404).json({ error: 'Aplicativo publicado não encontrado.' });
+    const result = await appsCollection.updateOne(
+      { _id: doc._id, $or: [{ status: { $exists: false } }, { status: 'approved' }] },
+      { $set: { blocked: true, blockReason: reason, blockedAt: new Date(), blockedBy: req.authUser._id } },
+    );
+    if (result.matchedCount !== 1) return res.status(409).json({ error: 'O aplicativo mudou de estado. Atualize a lista e tente novamente.' });
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, id: doc.slug || doc._id.toString(), blocked: true, blockReason: reason });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível bloquear o aplicativo agora.' });
+  }
+});
+
+app.post('/api/admin/apps/:appId/unblock', requireAdmin, async (req, res) => {
+  const appId = String(req.params.appId || '');
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(appId)) return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
+  try {
+    const doc = await findPublishedAppByPublicId(appId);
+    if (!doc) return res.status(404).json({ error: 'Aplicativo publicado não encontrado.' });
+    const result = await appsCollection.updateOne(
+      { _id: doc._id, $or: [{ status: { $exists: false } }, { status: 'approved' }] },
+      { $set: { blocked: false }, $unset: { blockReason: '', blockedAt: '', blockedBy: '' } },
+    );
+    if (result.matchedCount !== 1) return res.status(409).json({ error: 'O aplicativo mudou de estado. Atualize a lista e tente novamente.' });
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, id: doc.slug || doc._id.toString(), blocked: false });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível liberar o aplicativo agora.' });
+  }
+});
+
 app.get('/api/developer/me', requireUser, (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({
@@ -286,13 +342,14 @@ app.get('/api/health', readLimiter, async (_req, res) => {
 
 app.get('/api/apps', readLimiter, async (_req, res) => {
   try {
-    const docs = await appsCollection.find({ $or: [{ status: { $exists: false } }, { status: 'approved' }] }, { projection: { slug: 1, name: 1, category: 1, subcategory: 1, image: 1, apk: 1, description: 1, whatsNew: 1, createdAt: 1, featured: 1, developerName: 1, developerAccount: 1 } })
+    const docs = await appsCollection.find({ $or: [{ status: { $exists: false } }, { status: 'approved' }] }, { projection: { slug: 1, name: 1, category: 1, subcategory: 1, image: 1, apk: 1, description: 1, whatsNew: 1, createdAt: 1, featured: 1, developerName: 1, developerAccount: 1, blocked: 1, blockReason: 1 } })
       .sort({ createdAt: -1 }).limit(500).toArray();
     res.set('Cache-Control', 'no-store');
     res.json(docs.map((doc) => ({
       id: doc.slug || doc._id.toString(), name: doc.name, category: doc.category,
-      subcategory: doc.subcategory || '', image: doc.image, apk: doc.apk, description: doc.description,
-      whatsNew: doc.whatsNew || '', featured: Boolean(doc.featured),
+      subcategory: doc.subcategory || '', image: doc.image, apk: doc.blocked ? '' : doc.apk, description: doc.description,
+      whatsNew: doc.whatsNew || '', featured: Boolean(doc.featured), blocked: Boolean(doc.blocked),
+      blockReason: doc.blockReason || '',
       developerName: doc.developerName || doc.developerAccount || 'Publicador não informado',
     })));
   } catch (error) {
