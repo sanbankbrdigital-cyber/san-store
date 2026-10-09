@@ -3,7 +3,7 @@ name: Build SAN STORE Cliente APK
 on:
   push:
     paths:
-      - 'SAN-STORE-CLIENTE-CORRIGIDO-FONTE-v1.7.0.zip'
+      - 'SAN-STORE-CLIENTE-CORRIGIDO-FONTE-v1.7.1.zip'
       - '.github/workflows/build-client.yml'
       - 'server.js'
   workflow_dispatch:
@@ -40,13 +40,13 @@ jobs:
       - name: Build debug APK
         run: |
           mkdir -p "$RUNNER_TEMP/client-source"
-          unzip -q 'SAN-STORE-CLIENTE-CORRIGIDO-FONTE-v1.7.0.zip' -d "$RUNNER_TEMP/client-source"
-          cd "$RUNNER_TEMP/client-source/SAN-STORE-CLIENTE-CORRIGIDO-v1.7.0/FONTE/SAN_STORE_ANDROID"
+          unzip -q 'SAN-STORE-CLIENTE-CORRIGIDO-FONTE-v1.7.1.zip' -d "$RUNNER_TEMP/client-source"
+          cd "$RUNNER_TEMP/client-source/SAN-STORE-CLIENTE-CORRIGIDO-v1.7.1/FONTE/SAN_STORE_ANDROID"
           "$RUNNER_TEMP/gradle-8.13/bin/gradle" --no-daemon assembleDebug
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: SAN-STORE-CLIENTE-APK-v1.7.0
-          path: ${{ runner.temp }}/client-source/SAN-STORE-CLIENTE-CORRIGIDO-v1.7.0/FONTE/SAN_STORE_ANDROID/app/build/outputs/apk/debug/app-debug.apk
+          name: SAN-STORE-CLIENTE-APK-v1.7.1
+          path: ${{ runner.temp }}/client-source/SAN-STORE-CLIENTE-CORRIGIDO-v1.7.1/FONTE/SAN_STORE_ANDROID/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
