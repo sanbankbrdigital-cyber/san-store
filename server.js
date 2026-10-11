@@ -240,6 +240,52 @@ app.get('/api/admin/apps', requireAdmin, async (_req, res) => {
   }
 });
 
+app.get('/api/admin/apps/:appId', requireAdmin, async (req, res) => {
+  const appId = String(req.params.appId || '');
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(appId)) return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
+  try {
+    const doc = await findPublishedAppByPublicId(appId);
+    if (!doc) return res.status(404).json({ error: 'Aplicativo publicado não encontrado.' });
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      id: doc.slug || doc._id.toString(), name: doc.name, category: doc.category,
+      subcategory: doc.subcategory || '', image: doc.image, apk: doc.apk,
+      description: doc.description || '', whatsNew: doc.whatsNew || '',
+      screenshots: Array.isArray(doc.screenshots) ? doc.screenshots : [],
+      developerName: doc.developerName || doc.developerAccount || 'Publicador não informado',
+      blocked: Boolean(doc.blocked), blockReason: doc.blockReason || '', featured: Boolean(doc.featured),
+    });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível carregar os dados do aplicativo.' });
+  }
+});
+
+app.put('/api/admin/apps/:appId', requireAdmin, async (req, res) => {
+  const appId = String(req.params.appId || '');
+  const fields = submissionPayload(req.body);
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(appId)) return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
+  if (!fields) return res.status(400).json({ error: 'Confira nome, tipo, categoria, links HTTPS, descrição, novidades e capturas PNG.' });
+  try {
+    const doc = await findPublishedAppByPublicId(appId);
+    if (!doc) return res.status(404).json({ error: 'Aplicativo publicado não encontrado.' });
+    const updatedFields = {
+      name: fields.name, category: fields.category, subcategory: fields.subcategory,
+      image: fields.image, apk: fields.apk, description: fields.description,
+      whatsNew: fields.whatsNew, updatedAt: new Date(), updatedBy: req.authUser._id,
+      ...(fields.screenshots ? { screenshots: fields.screenshots } : {}),
+    };
+    const result = await appsCollection.updateOne(
+      { _id: doc._id, $or: [{ status: { $exists: false } }, { status: 'approved' }] },
+      { $set: updatedFields },
+    );
+    if (result.matchedCount !== 1) return res.status(409).json({ error: 'O aplicativo mudou de estado. Atualize a lista e tente novamente.' });
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, id: doc.slug || doc._id.toString(), message: 'Alterações salvas no aplicativo publicado.' });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível salvar as alterações do aplicativo.' });
+  }
+});
+
 app.post('/api/admin/apps/:appId/block', requireAdmin, async (req, res) => {
   const appId = String(req.params.appId || '');
   const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
