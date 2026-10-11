@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const { promisify } = require('util');
 const scryptAsync = promisify(crypto.scrypt);
 const registerAccountRoutes = require('./account-routes');
+const registerStorePageRoutes = require('./store-page-routes');
 
 const required = ['MONGODB_URI', 'APP_PUBLISH_KEY'];
 const missing = required.filter((key) => !process.env[key]);
@@ -702,6 +703,8 @@ async function findPublishedAppByPublicId(appId) {
     ],
   });
 }
+
+registerStorePageRoutes(app, { findPublishedAppByPublicId, validHttpsUrl, readLimiter });
 
 function safeSlug(value, id) {
   const base = String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
