@@ -7,6 +7,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { promisify } = require('util');
 const scryptAsync = promisify(crypto.scrypt);
+const registerAccountRoutes = require('./account-routes');
 
 const required = ['MONGODB_URI', 'APP_PUBLISH_KEY'];
 const missing = required.filter((key) => !process.env[key]);
@@ -25,6 +26,7 @@ let submissionsCollection;
 let reviewsCollection;
 let appAppealsCollection;
 let settingsCollection;
+let passwordResetRequestsCollection;
 let dummyPasswordHash;
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
@@ -136,6 +138,20 @@ function requireDeveloper(req, res, next) {
     next();
   });
 }
+
+registerAccountRoutes(app, {
+  users: () => usersCollection,
+  resetRequests: () => passwordResetRequestsCollection,
+  sessions: () => sessionsCollection,
+  requireUser,
+  requireAdmin,
+  hashPassword,
+  validPassword,
+  normalizeEmail,
+  emailPattern: EMAIL_PATTERN,
+  ObjectId,
+  authLimiter,
+});
 
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   const account = normalizeAccount(req.body?.account);
@@ -920,6 +936,7 @@ async function start() {
   reviewsCollection = db.collection('app_reviews');
   appAppealsCollection = db.collection('app_appeals');
   settingsCollection = db.collection('settings');
+  passwordResetRequestsCollection = db.collection('password_reset_requests');
   dummyPasswordHash = await hashPassword(crypto.randomBytes(32).toString('hex'));
   await Promise.all([
     appsCollection.createIndex({ createdAt: -1 }),
@@ -930,6 +947,8 @@ async function start() {
     sessionsCollection.createIndex({ tokenHash: 1 }, { unique: true }),
     sessionsCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
     sessionsCollection.createIndex({ userId: 1 }),
+    passwordResetRequestsCollection.createIndex({ userId: 1 }, { unique: true, partialFilterExpression: { status: 'pending' } }),
+    passwordResetRequestsCollection.createIndex({ status: 1, createdAt: -1 }),
     submissionsCollection.createIndex({ status: 1, createdAt: -1 }),
     submissionsCollection.createIndex({ submittedBy: 1, createdAt: -1 }),
     submissionsCollection.createIndex({ targetAppId: 1 }, { unique: true, partialFilterExpression: { status: 'pending', submissionType: 'update' } }),
