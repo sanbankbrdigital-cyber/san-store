@@ -42,7 +42,7 @@ app.use(helmet({
     },
   },
 }));
-app.use(express.json({ limit: '20kb' }));
+app.use(express.json({ limit: '8mb' }));
 const readLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 180, standardHeaders: 'draft-8', legacyHeaders: false });
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false });
 const publishLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false });
@@ -485,6 +485,19 @@ app.get('/api/apps', readLimiter, async (_req, res) => {
   }
 });
 
+app.get('/api/apps/:appId/screenshots', readLimiter, async (req, res) => {
+  const appId = String(req.params.appId || '');
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(appId)) return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
+  try {
+    const storeApp = await findPublishedAppByPublicId(appId);
+    if (!storeApp) return res.status(404).json({ error: 'Aplicativo não encontrado na loja.' });
+    res.set('Cache-Control', 'no-store');
+    return res.json({ appId, screenshots: Array.isArray(storeApp.screenshots) ? storeApp.screenshots : [] });
+  } catch {
+    return res.status(503).json({ error: 'Não foi possível carregar as capturas de tela.' });
+  }
+});
+
 app.get('/api/apps/:appId/reviews', readLimiter, async (req, res) => {
   const appId = String(req.params.appId || '');
   if (!/^[A-Za-z0-9_-]{1,120}$/.test(appId)) return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
@@ -540,8 +553,10 @@ app.post('/api/apps/:appId/reviews', publishLimiter, requireUser, async (req, re
 
 app.post('/api/submissions', publishLimiter, requireDeveloper, async (req, res) => {
   const payload = submissionPayload(req.body);
-  if (!payload) return res.status(400).json({ error: 'Confira nome, tipo, categoria, links HTTPS, descrição e novidades (até 500 caracteres).' });
   const requestedAppId = typeof req.body?.appId === 'string' ? req.body.appId.trim() : '';
+  if (!payload || (!requestedAppId && !Array.isArray(payload.screenshots))) {
+    return res.status(400).json({ error: 'Confira os dados e envie de 2 a 8 capturas PNG válidas (até 512 KB cada).' });
+  }
   if (requestedAppId && !/^[A-Za-z0-9_-]{1,120}$/.test(requestedAppId)) {
     return res.status(400).json({ error: 'Identificador do aplicativo inválido.' });
   }
@@ -632,18 +647,49 @@ function safeSlug(value, id) {
   return `${base}-${id.toString()}`;
 }
 
+const MIN_SCREENSHOTS = 2;
+const MAX_SCREENSHOTS = 8;
+const MAX_SCREENSHOT_BYTES = 512 * 1024;
+const MAX_SCREENSHOTS_TOTAL_BYTES = 4 * 1024 * 1024;
+
+function validateScreenshots(value) {
+  if (!Array.isArray(value) || value.length < MIN_SCREENSHOTS || value.length > MAX_SCREENSHOTS) return null;
+  const screenshots = [];
+  let totalBytes = 0;
+  const base64Pattern = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+  for (const encoded of value) {
+    if (typeof encoded !== 'string' || encoded.length > Math.ceil(MAX_SCREENSHOT_BYTES / 3) * 4 || !base64Pattern.test(encoded)) return null;
+    const bytes = Buffer.from(encoded, 'base64');
+    if (bytes.length < 24 || bytes.length > MAX_SCREENSHOT_BYTES || bytes.toString('base64') !== encoded) return null;
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    if (!bytes.subarray(0, 8).equals(pngSignature) || bytes.toString('ascii', 12, 16) !== 'IHDR') return null;
+    const width = bytes.readUInt32BE(16);
+    const height = bytes.readUInt32BE(20);
+    if (width < 1 || height < 1 || width > 5000 || height > 5000 || width * height > 20_000_000) return null;
+    totalBytes += bytes.length;
+    if (totalBytes > MAX_SCREENSHOTS_TOTAL_BYTES) return null;
+    screenshots.push(encoded);
+  }
+  return screenshots;
+}
+
 function submissionPayload(body) {
   const { name, category, image, apk, description } = body || {};
   const subcategory = typeof body?.subcategory === 'string' ? body.subcategory.trim() : '';
   const whatsNew = typeof body?.whatsNew === 'string' ? body.whatsNew.trim() : '';
-  if (whatsNew.length > 500) return null;
+  const hasScreenshots = Object.prototype.hasOwnProperty.call(body || {}, 'screenshots');
+  const screenshots = hasScreenshots ? validateScreenshots(body.screenshots) : undefined;
+  if (whatsNew.length > 500 || (hasScreenshots && !screenshots)) return null;
   if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 60 ||
       !['App', 'Game'].includes(category) || !validSubcategory(subcategory) || !validHttpsUrl(image) || !validHttpsUrl(apk) ||
       typeof description !== 'string' || description.trim().length < 5 || description.trim().length > 350) return null;
-  return { name: name.trim(), category, subcategory, image: new URL(image).href, apk: new URL(apk).href, description: description.trim(), whatsNew };
+  return {
+    name: name.trim(), category, subcategory, image: new URL(image).href, apk: new URL(apk).href,
+    description: description.trim(), whatsNew, ...(hasScreenshots ? { screenshots } : {}),
+  };
 }
 
-function submissionJson(doc) {
+function submissionJson(doc, includeScreenshots = false) {
   return {
     id: doc._id.toString(), name: doc.name, category: doc.category, subcategory: doc.subcategory || '', image: doc.image,
     apk: doc.apk, description: doc.description, whatsNew: doc.whatsNew || '', status: doc.status,
@@ -651,6 +697,7 @@ function submissionJson(doc) {
     developerAccount: doc.developerAccount || 'desenvolvedor-web',
     developerName: doc.developerName || doc.developerAccount || 'Desenvolvedor',
     createdAt: doc.createdAt || null, rejectionReason: doc.rejectionReason || '',
+    ...(includeScreenshots ? { screenshots: doc.screenshots || [] } : {}),
   };
 }
 
@@ -673,7 +720,7 @@ app.get('/api/admin/submissions/:id', requireAdmin, async (req, res) => {
     const doc = await submissionsCollection.findOne({ _id: id });
     if (!doc) return res.status(404).json({ error: 'Publicação não encontrada.' });
     res.set('Cache-Control', 'no-store');
-    res.json(submissionJson(doc));
+    res.json(submissionJson(doc, true));
   } catch {
     res.status(503).json({ error: 'Não foi possível abrir a publicação.' });
   }
@@ -725,7 +772,8 @@ app.post('/api/admin/submissions/:id/approve', requireAdmin, async (req, res) =>
       // Update only listing metadata: _id, public slug, reviews, and featured status remain untouched.
       const updated = await appsCollection.updateOne(
         { _id: target._id, developerAccount: submission.developerAccount, $or: [{ status: { $exists: false } }, { status: 'approved' }] },
-        { $set: { image: fields.image, apk: fields.apk, description: fields.description, whatsNew: fields.whatsNew, updatedAt: reviewedAt } },
+        { $set: { image: fields.image, apk: fields.apk, description: fields.description, whatsNew: fields.whatsNew,
+          ...(fields.screenshots ? { screenshots: fields.screenshots } : {}), updatedAt: reviewedAt } },
       );
       if (updated.matchedCount !== 1) {
         await submissionsCollection.updateOne({ _id: id, status: 'approved' }, { $set: { status: 'pending' }, $unset: { approvedAppId: '', reviewedAt: '', reviewedBy: '' } });
